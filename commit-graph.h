@@ -140,7 +140,7 @@ struct commit_graph_data {
 	uint32_t generation;
 };
 
-/* 
+/*
  * Commits should be parsed before accessing generation, graph positions.
  */
 uint32_t commit_graph_generation(const struct commit *);
