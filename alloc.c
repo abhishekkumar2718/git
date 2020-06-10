@@ -101,7 +101,9 @@ void *alloc_object_node(struct repository *r)
 
 static unsigned int alloc_commit_index(struct repository *r)
 {
-	return r->parsed_objects->commit_count++;
+	static unsigned int parsed_commits_count = 0;
+	r->parsed_objects->commit_count++;
+	return parsed_commits_count++;
 }
 
 void init_commit_node(struct repository *r, struct commit *c)
