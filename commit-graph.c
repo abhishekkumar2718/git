@@ -1527,7 +1527,10 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 static void compute_corrected_commit_date_offsets(struct write_commit_graph_context *ctx)
 {
 	int i;
+	uint32_t max_odate = 0;
 	struct commit_list *list = NULL;
+
+	trace2_region_enter("commit-graph", "compute_corrected_commit_date_offsets", ctx->r);
 
 	if (ctx->report_progress)
 		ctx->progress = start_delayed_progress(
@@ -1579,10 +1582,16 @@ static void compute_corrected_commit_date_offsets(struct write_commit_graph_cont
 
 				if (data->generation > GENERATION_NUMBER_MAX)
 					data->generation = GENERATION_NUMBER_MAX;
+
+				if (max_odate < data->generation)
+					max_odate = data->generation;
 			}
 		}
 	}
 	stop_progress(&ctx->progress);
+
+	trace2_data_intmax("commit-graph", ctx->r, "max_odata", max_odate);
+	trace2_region_leave("commit-graph", "compute_corrected_commit_date_offsets", ctx->r);
 }
 
 /*
