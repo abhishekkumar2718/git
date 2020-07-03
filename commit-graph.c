@@ -60,13 +60,6 @@ void git_test_write_commit_graph_or_die(void)
  *   V4 - GENERATION_NUMBERS_MAX in CDAT, Corrected Commit Date in GDAT (0, 1, 1, 0, 0)
  */
 
-#define GRAPH_METADATA_CHUNK_ENABLED 0
-
-#define GRAPH_GENERATION_DATA_CHUNK_ENABLED 0
-#define GENERATION_NUMBER_V3 0
-#define GENERATION_NUMBER_V5 0
-#define GENERATION_COMPUTE_TOPOLOGICAL_LEVEL 0
-
 #define GRAPH_DATA_WIDTH (the_hash_algo->rawsz + 16)
 
 #define GRAPH_VERSION_1 0x1
@@ -1162,16 +1155,16 @@ static void write_graph_chunk_data(struct hashfile *f, int hash_len,
 		else
 			packedDate[0] = 0;
 
-		if (GRAPH_METADATA_CHUNK_ENABLED)
+		if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0))
 			/* Copy corrected date offsets into CDAT */
 			packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
-		if (GRAPH_GENERATION_DATA_CHUNK_ENABLED) {
-			if (GENERATION_NUMBER_V5)
+		else if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
+			if (git_env_bool("GIT_GENERATION_NUMBER_V5", 0))
 				/* Copy corrected date offset into CDAT when using V5 */
 				packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
-			else if (GENERATION_NUMBER_V3)
+			else if (git_env_bool("GIT_GENERATION_NUMBER_V3", 0))
 			{
-				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL)
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0))
 					/* Copy topological levels if calculated when using V3 */
 					packedDate[0] |= htonl(commit_graph_data_at(*list)->graph_pos << 2);
 				else
@@ -1434,7 +1427,7 @@ static void close_reachable(struct write_commit_graph_context *ctx)
  *
  * Store the Offset(C) in commit_graph_data->generation.
  *
- * If GENERATION_COMPUTE_TOPOLOGICAL_LEVEL is set, calculate and store
+ * If $GIT_COMPUTE_TOPOLOGICAL_LEVEL is set, calculate and store
  * topological levels in commit_graph_data->graph_pos
  */
 static void compute_corrected_commit_dates(struct write_commit_graph_context *ctx)
@@ -1483,7 +1476,7 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 					if (parent_timestamp > max_timestamp)
 						max_timestamp = parent_timestamp + 1;
 
-					if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
+					if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
 						level = data->graph_pos;
 
 						if (max_level < level) {
@@ -1498,7 +1491,7 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 
 				data->generation = (uint32_t) (max_timestamp - current->date) + 1;
 
-				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
 					data->graph_pos = max_level + 1;
 				}
 
@@ -1510,7 +1503,7 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 				if (data->generation > max_odate)
 					max_odate = data->generation;
 
-				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
 					if (data->graph_pos > GENERATION_NUMBER_MAX)
 						data->graph_pos = GENERATION_NUMBER_MAX;
 				}
@@ -1973,11 +1966,11 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	chunk_ids[0] = GRAPH_CHUNKID_OIDFANOUT;
 	chunk_ids[1] = GRAPH_CHUNKID_OIDLOOKUP;
 	chunk_ids[2] = GRAPH_CHUNKID_DATA;
-	if (GRAPH_METADATA_CHUNK_ENABLED) {
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0)) {
 		chunk_ids[num_chunks] = GRAPH_CHUNKID_METADATA;
 		num_chunks++;
 	}
-	if (GRAPH_GENERATION_DATA_CHUNK_ENABLED) {
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
 		chunk_ids[num_chunks] = GRAPH_CHUNKID_GENERATION_DATA;
 		num_chunks++;
 	}
@@ -2004,7 +1997,7 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	chunk_offsets[3] = chunk_offsets[2] + (hashsz + 16) * ctx->commits.nr;
 
 	num_chunks = 3;
-	if (GRAPH_METADATA_CHUNK_ENABLED) {
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0)) {
 		/*
 		 * Existence of "META" in chunk lookup is enough for
 		 * proof of concept
@@ -2012,7 +2005,7 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 		chunk_offsets[num_chunks + 1] = chunk_offsets[num_chunks];
 		num_chunks++;
 	}
-	if (GRAPH_GENERATION_DATA_CHUNK_ENABLED) {
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
 		chunk_offsets[num_chunks + 1] = chunk_offsets[num_chunks] +
 						sizeof(timestamp_t) * ctx->commits.nr;
 		num_chunks++;
@@ -2066,9 +2059,9 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	write_graph_chunk_fanout(f, ctx);
 	write_graph_chunk_oids(f, hashsz, ctx);
 	write_graph_chunk_data(f, hashsz, ctx);
-	if (GRAPH_METADATA_CHUNK_ENABLED)
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0))
 		write_graph_chunk_metadata(ctx);
-	if (GRAPH_GENERATION_DATA_CHUNK_ENABLED)
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0))
 		write_graph_chunk_generation_data(f, ctx);
 	if (ctx->num_extra_edges)
 		write_graph_chunk_extra_edges(f, ctx);
@@ -2514,9 +2507,9 @@ int write_commit_graph(struct object_directory *odb,
 	} else
 		ctx->num_commit_graphs_after = 1;
 
-	if (GENERATION_NUMBER_V3)
+	if (git_env_bool("GIT_GENERATION_NUMBER_V3", 0))
 		compute_corrected_commit_dates(ctx);
-	else if (GENERATION_NUMBER_V5)
+	else if (git_env_bool("GIT_GENERATION_NUMBER_V5", 0))
 		compute_corrected_commit_date_offsets(ctx);
 	else
 		compute_generation_numbers(ctx);
