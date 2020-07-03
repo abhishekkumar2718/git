@@ -42,7 +42,23 @@ void git_test_write_commit_graph_or_die(void)
 #define GRAPH_CHUNKID_BLOOMINDEXES 0x42494458 /* "BIDX" */
 #define GRAPH_CHUNKID_BLOOMDATA 0x42444154 /* "BDAT" */
 #define GRAPH_CHUNKID_BASE 0x42415345 /* "BASE" */
-#define MAX_NUM_CHUNKS 7
+#define GRAPH_CHUNKID_METADATA 0x4d455441 /* "META" */
+#define GRAPH_CHUNKID_GENERATION_DATA 0x47444154 /* "GDAT" */
+#define MAX_NUM_CHUNKS 8
+
+
+/*
+ * V0 - Topological level (0, 0, 0, 0, 0)
+ *
+ * Metadata Chunk:
+ *   V1 - Corrected Commit Date Offsets in CDAT (1, 0, 0, 1, X)
+ *
+ * Generation Data Chunk:
+ *   V2 - Corrected Commit Date Offsets in CDAT, Corrected Date With
+ *   Monotonic Offsets in GDAT (0, 1, 0, 1, X)
+ *   V3 - Topological Levels in CDAT, Corrected Commit Date in GDAT (0, 1, 1, 0, 1)
+ *   V4 - GENERATION_NUMBERS_MAX in CDAT, Corrected Commit Date in GDAT (0, 1, 1, 0, 0)
+ */
 
 #define GRAPH_DATA_WIDTH (the_hash_algo->rawsz + 16)
 
@@ -99,7 +115,7 @@ uint32_t commit_graph_position(const struct commit *c)
 	return data ? data->graph_pos : COMMIT_NOT_FROM_GRAPH;
 }
 
-uint32_t commit_graph_generation(const struct commit *c)
+timestamp_t commit_graph_generation(const struct commit *c)
 {
 	struct commit_graph_data *data =
 		commit_graph_data_slab_peek(&commit_graph_data_slab, c);
@@ -372,6 +388,20 @@ struct commit_graph *parse_commit_graph(void *graph_map, size_t graph_size)
 				graph->chunk_commit_data = data + chunk_offset;
 			break;
 
+		case GRAPH_CHUNKID_METADATA:
+			if (graph->chunk_metadata)
+				chunk_repeated = 1;
+			else
+				graph->chunk_metadata = data + chunk_offset;
+			break;
+
+		case GRAPH_CHUNKID_GENERATION_DATA:
+			if (graph->chunk_generation_data)
+				chunk_repeated = 1;
+			else
+				graph->chunk_generation_data = data + chunk_offset;
+			break;
+
 		case GRAPH_CHUNKID_EXTRAEDGES:
 			if (graph->chunk_extra_edges)
 				chunk_repeated = 1;
@@ -410,6 +440,7 @@ struct commit_graph *parse_commit_graph(void *graph_map, size_t graph_size)
 				graph->bloom_filter_settings->bits_per_entry = get_be32(data + chunk_offset + 8);
 			}
 			break;
+
 		}
 
 		if (chunk_repeated) {
@@ -733,16 +764,42 @@ static void fill_commit_graph_info(struct commit *item, struct commit_graph *g, 
 	const unsigned char *commit_data;
 	struct commit_graph_data *graph_data;
 	uint32_t lex_index;
+	timestamp_t generation;
 
 	while (pos < g->num_commits_in_base)
 		g = g->base_graph;
 
 	lex_index = pos - g->num_commits_in_base;
-	commit_data = g->chunk_commit_data + GRAPH_DATA_WIDTH * lex_index;
 
 	graph_data = commit_graph_data_at(item);
 	graph_data->graph_pos = pos;
-	graph_data->generation = get_be32(commit_data + g->hash_len + 8) >> 2;
+
+	if (g->chunk_generation_data)
+		/*
+		 * Load corrected commit date (or corrected commit date
+		 * with monotonic offset) from GDAT
+		 */
+		generation = get_be64(g->chunk_generation_data + sizeof(timestamp_t) * lex_index);
+	else if (g->chunk_metadata)
+	{
+		/* Load corrected commit date offset from CDAT and add to commit date */
+		uint64_t offset, date_low, date_high;
+
+		commit_data = g->chunk_commit_data + GRAPH_DATA_WIDTH * lex_index;
+		offset = get_be32(commit_data + g->hash_len + 8) >> 2;
+		date_high = get_be32(commit_data + g->hash_len + 8) & 0x3;
+		date_low = get_be32(commit_data + g->hash_len + 12);
+
+		generation = offset + (date_high << 32 | date_low);
+	}
+	else
+	{
+		/* Load topological level from CDAT */
+		commit_data = g->chunk_commit_data + GRAPH_DATA_WIDTH * lex_index;
+		generation = get_be32(commit_data + g->hash_len + 8) >> 2;
+	}
+
+	graph_data->generation = generation;
 }
 
 static inline void set_commit_tree(struct commit *c, struct tree *t)
@@ -760,7 +817,8 @@ static int fill_commit_in_graph(struct repository *r,
 	struct commit_list **pptr;
 	struct commit_graph_data *graph_data;
 	const unsigned char *commit_data;
-	uint32_t lex_index;
+	uint32_t lex_index, offset;
+	timestamp_t generation;
 
 	while (pos < g->num_commits_in_base)
 		g = g->base_graph;
@@ -786,7 +844,23 @@ static int fill_commit_in_graph(struct repository *r,
 	date_low = get_be32(commit_data + g->hash_len + 12);
 	item->date = (timestamp_t)((date_high << 32) | date_low);
 
-	graph_data->generation = get_be32(commit_data + g->hash_len + 8) >> 2;
+	if (g->chunk_generation_data)
+		/*
+		 * Load corrected commit date (or corrected commit date
+		 * with monotonic offset) from GDAT
+		 */
+		generation = get_be64(g->chunk_generation_data + sizeof(timestamp_t) * lex_index);
+	else if (g->chunk_metadata)
+		/* Load corrected commit date offset from CDAT and add to commit date */
+	{
+		offset = get_be32(commit_data + g->hash_len + 8) >> 2;
+		generation = offset + (date_high << 2 | date_low);
+	}
+	else
+		/* Load topological level from CDAT */
+		generation = get_be32(commit_data + g->hash_len + 8) >> 2;
+
+	graph_data->generation = generation;
 
 	pptr = &item->parents;
 
@@ -1081,11 +1155,56 @@ static void write_graph_chunk_data(struct hashfile *f, int hash_len,
 		else
 			packedDate[0] = 0;
 
-		packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
+		if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0))
+			/* Copy corrected date offsets into CDAT */
+			packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
+		else if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
+			if (git_env_bool("GIT_GENERATION_NUMBER_V5", 0))
+				/* Copy corrected date offset into CDAT when using V5 */
+				packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
+			else if (git_env_bool("GIT_GENERATION_NUMBER_V3", 0))
+			{
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0))
+					/* Copy topological levels if calculated when using V3 */
+					packedDate[0] |= htonl(commit_graph_data_at(*list)->graph_pos << 2);
+				else
+					packedDate[0] |= htonl(GENERATION_NUMBER_INFINITY << 2);
+			}
+		}
+		else
+			packedDate[0] |= htonl(commit_graph_data_at(*list)->generation << 2);
 
 		packedDate[1] = htonl((*list)->date);
 		hashwrite(f, packedDate, 8);
 
+		list++;
+	}
+}
+
+static void write_graph_chunk_metadata(struct write_commit_graph_context *ctx)
+{
+	ctx->progress_cnt += ctx->commits.nr;
+	display_progress(ctx->progress, ctx->progress_cnt);
+}
+
+static void write_graph_chunk_generation_data(struct hashfile *f,
+				   struct write_commit_graph_context *ctx)
+{
+	struct commit **list = ctx->commits.list;
+	struct commit **last = ctx->commits.list + ctx->commits.nr;
+
+	while (list < last) {
+		timestamp_t cdate;
+		uint32_t packedDate[2];
+
+		/* Add corrected date offset to commit date */
+		cdate = (*list)->date + commit_graph_data_at(*list)->generation;
+
+		packedDate[0] = htonl(cdate >> 32);
+		packedDate[1] = htonl(cdate);
+
+		display_progress(ctx->progress, ++ctx->progress_cnt);
+		hashwrite(f, packedDate, sizeof(timestamp_t));
 		list++;
 	}
 }
@@ -1302,9 +1421,190 @@ static void close_reachable(struct write_commit_graph_context *ctx)
 	stop_progress(&ctx->progress);
 }
 
-static void compute_generation_numbers(struct write_commit_graph_context *ctx)
+/*
+ * CCD_3(C) = Date(C) + Offset(C) such that CCD_3(C) > CCD_3(P) for
+ * all parents P of C.
+ *
+ * Store the Offset(C) in commit_graph_data->generation.
+ *
+ * If $GIT_COMPUTE_TOPOLOGICAL_LEVEL is set, calculate and store
+ * topological levels in commit_graph_data->graph_pos
+ */
+static void compute_corrected_commit_dates(struct write_commit_graph_context *ctx)
 {
 	int i;
+	struct commit_list *list = NULL;
+	uint32_t max_odate = 0;
+
+	trace2_region_enter("commit-graph", "compute_corrected_commit_dates", ctx->r);
+
+	if (ctx->report_progress)
+		ctx->progress = start_delayed_progress(
+					_("Computing commit graph generation numbers"),
+					ctx->commits.nr);
+
+	for (i = 0; i < ctx->commits.nr; i++) {
+		uint32_t level, max_level = 0;
+		struct commit_graph_data *data = commit_graph_data_at(ctx->commits.list[i]);
+
+		display_progress(ctx->progress, i + 1);
+
+		if (data->generation != GENERATION_NUMBER_INFINITY &&
+		    data->generation != GENERATION_NUMBER_ZERO)
+			continue;
+
+		commit_list_insert(ctx->commits.list[i], &list);
+
+		while (list) {
+			struct commit *current = list->item;
+			struct commit_list *parent;
+			int all_parents_computed = 1;
+			timestamp_t max_timestamp = current->date;
+
+			for (parent = current->parents; parent; parent = parent->next) {
+				timestamp_t parent_timestamp;
+				data = commit_graph_data_at(parent->item);
+
+				if (data->generation == GENERATION_NUMBER_INFINITY ||
+				    data->generation == GENERATION_NUMBER_ZERO) {
+					all_parents_computed = 0;
+					commit_list_insert(parent->item, &list);
+					break;
+				} else {
+					parent_timestamp = parent->item->date + data->generation;
+
+					if (parent_timestamp > max_timestamp)
+						max_timestamp = parent_timestamp + 1;
+
+					if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
+						level = data->graph_pos;
+
+						if (max_level < level) {
+							max_level = level;
+						}
+					}
+				}
+			}
+
+			if (all_parents_computed) {
+				data = commit_graph_data_at(current);
+
+				data->generation = (uint32_t) (max_timestamp - current->date) + 1;
+
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
+					data->graph_pos = max_level + 1;
+				}
+
+				pop_commit(&list);
+
+				if (data->generation > GENERATION_NUMBER_MAX)
+					data->generation = GENERATION_NUMBER_MAX;
+
+				if (data->generation > max_odate)
+					max_odate = data->generation;
+
+				if (git_env_bool("GIT_COMPUTE_TOPOLOGICAL_LEVEL", 0)) {
+					if (data->graph_pos > GENERATION_NUMBER_MAX)
+						data->graph_pos = GENERATION_NUMBER_MAX;
+				}
+			}
+		}
+	}
+
+	trace2_data_intmax("commit-graph", ctx->r, "max_odate3", max_odate);
+	trace2_region_leave("commit-graph", "compute_corrected_commit_dates", ctx->r);
+
+	stop_progress(&ctx->progress);
+}
+
+/*
+ * CCD_5(C) = Date(C) + Offset(C) such that for all parents P of C,
+ * CCD_5(C) > CCD_5(P) and Offset(C) > Offset(P)
+ *
+ * Store Offset(C) in commit_graph_data->generation.
+ *
+ * For both metadata and generation data chunk approaches, write the
+ * corrected date offset into CDAT.
+ *
+ * For generation data chunk, write out corrected date (c->date + c->generation)
+ * into GDAT as well.
+ */
+static void compute_corrected_commit_date_offsets(struct write_commit_graph_context *ctx)
+{
+	int i;
+	uint32_t max_odate = 0;
+	struct commit_list *list = NULL;
+
+	trace2_region_enter("commit-graph", "compute_corrected_commit_date_offsets", ctx->r);
+
+	if (ctx->report_progress)
+		ctx->progress = start_delayed_progress(
+					_("Computing commit graph generation numbers"),
+					ctx->commits.nr);
+	for (i = 0; i < ctx->commits.nr; i++) {
+		uint32_t offset = commit_graph_data_at(ctx->commits.list[i])->generation;
+
+		display_progress(ctx->progress, i + 1);
+		if (offset != GENERATION_NUMBER_INFINITY &&
+		    offset != GENERATION_NUMBER_ZERO)
+			continue;
+
+		commit_list_insert(ctx->commits.list[i], &list);
+		while (list) {
+			struct commit *current = list->item;
+			struct commit_list *parent;
+			int all_parents_computed = 1;
+			uint32_t max_offset = 0;
+			timestamp_t max_timestamp = current->date;
+
+			for (parent = current->parents; parent; parent = parent->next) {
+				offset = commit_graph_data_at(parent->item)->generation;
+
+				if (offset == GENERATION_NUMBER_INFINITY ||
+				    offset == GENERATION_NUMBER_ZERO) {
+					all_parents_computed = 0;
+					commit_list_insert(parent->item, &list);
+					break;
+				} else {
+					timestamp_t timestamp = parent->item->date + offset;
+
+					if (offset > max_offset)
+						max_offset = offset;
+
+					if (timestamp > max_timestamp)
+						max_timestamp = timestamp + 1;
+				}
+			}
+
+			if (all_parents_computed) {
+				struct commit_graph_data *data = commit_graph_data_at(current);
+
+				data->generation = (max_timestamp - current->date) + 1;
+				pop_commit(&list);
+
+				if (data->generation < max_offset + 1)
+					data->generation = max_offset + 1;
+
+				if (data->generation > GENERATION_NUMBER_MAX)
+					data->generation = GENERATION_NUMBER_MAX;
+
+				if (max_odate < data->generation)
+					max_odate = data->generation;
+			}
+		}
+	}
+	stop_progress(&ctx->progress);
+
+	trace2_data_intmax("commit-graph", ctx->r, "max_odata", max_odate);
+	trace2_region_leave("commit-graph", "compute_corrected_commit_date_offsets", ctx->r);
+}
+
+/*
+ * Store topological level in commit_graph_data->generation
+ */
+static void compute_generation_numbers(struct write_commit_graph_context *ctx)
+{
+	int i, max_gen = 0;
 	struct commit_list *list = NULL;
 
 	if (ctx->report_progress)
@@ -1347,6 +1647,9 @@ static void compute_generation_numbers(struct write_commit_graph_context *ctx)
 
 				if (data->generation > GENERATION_NUMBER_MAX)
 					data->generation = GENERATION_NUMBER_MAX;
+
+				if (data->generation > max_gen)
+					max_gen = data->generation;
 			}
 		}
 	}
@@ -1663,6 +1966,14 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	chunk_ids[0] = GRAPH_CHUNKID_OIDFANOUT;
 	chunk_ids[1] = GRAPH_CHUNKID_OIDLOOKUP;
 	chunk_ids[2] = GRAPH_CHUNKID_DATA;
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0)) {
+		chunk_ids[num_chunks] = GRAPH_CHUNKID_METADATA;
+		num_chunks++;
+	}
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
+		chunk_ids[num_chunks] = GRAPH_CHUNKID_GENERATION_DATA;
+		num_chunks++;
+	}
 	if (ctx->num_extra_edges) {
 		chunk_ids[num_chunks] = GRAPH_CHUNKID_EXTRAEDGES;
 		num_chunks++;
@@ -1686,6 +1997,19 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	chunk_offsets[3] = chunk_offsets[2] + (hashsz + 16) * ctx->commits.nr;
 
 	num_chunks = 3;
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0)) {
+		/*
+		 * Existence of "META" in chunk lookup is enough for
+		 * proof of concept
+		 */
+		chunk_offsets[num_chunks + 1] = chunk_offsets[num_chunks];
+		num_chunks++;
+	}
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0)) {
+		chunk_offsets[num_chunks + 1] = chunk_offsets[num_chunks] +
+						sizeof(timestamp_t) * ctx->commits.nr;
+		num_chunks++;
+	}
 	if (ctx->num_extra_edges) {
 		chunk_offsets[num_chunks + 1] = chunk_offsets[num_chunks] +
 						4 * ctx->num_extra_edges;
@@ -1735,6 +2059,10 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 	write_graph_chunk_fanout(f, ctx);
 	write_graph_chunk_oids(f, hashsz, ctx);
 	write_graph_chunk_data(f, hashsz, ctx);
+	if (git_env_bool("GIT_METADATA_CHUNK_ENABLED", 0))
+		write_graph_chunk_metadata(ctx);
+	if (git_env_bool("GIT_GENERATION_DATA_CHUNK_ENABLED", 0))
+		write_graph_chunk_generation_data(f, ctx);
 	if (ctx->num_extra_edges)
 		write_graph_chunk_extra_edges(f, ctx);
 	if (ctx->changed_paths) {
@@ -2179,7 +2507,12 @@ int write_commit_graph(struct object_directory *odb,
 	} else
 		ctx->num_commit_graphs_after = 1;
 
-	compute_generation_numbers(ctx);
+	if (git_env_bool("GIT_GENERATION_NUMBER_V3", 0))
+		compute_corrected_commit_dates(ctx);
+	else if (git_env_bool("GIT_GENERATION_NUMBER_V5", 0))
+		compute_corrected_commit_date_offsets(ctx);
+	else
+		compute_generation_numbers(ctx);
 
 	if (ctx->changed_paths)
 		compute_bloom_filters(ctx);

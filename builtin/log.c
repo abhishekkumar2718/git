@@ -444,6 +444,8 @@ static int cmd_log_walk(struct rev_info *rev)
 	    rev->diffopt.flags.check_failed) {
 		return 02;
 	}
+
+	log_topo_stats(rev);
 	return diff_result_code(&rev->diffopt, 0);
 }
 

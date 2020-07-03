@@ -1,0 +1,43 @@
+#!/usr/bin/python
+
+# Python Script to parse the output of time and generate mean, standard deviation
+
+import sys, math
+
+def mean(rows):
+    return sum(rows)/len(rows)
+
+def std_dev(rows):
+    total = 0
+    avg = mean(rows)
+
+    for x in rows:
+        total = total + abs(x - avg) ** 2
+
+    return math.sqrt(total/len(rows))
+
+
+with open(sys.argv[1]) as f:
+    rows = f.read().split()
+
+real_times = []
+user_times = []
+sys_times = []
+
+for i in range(len(rows)):
+    rem = i % 6
+    
+    if i % 2 == 0:
+        continue
+
+    val = float(rows[i][2:-1])
+    if rem == 1:
+        real_times.append(val)
+    elif rem == 3:
+        user_times.append(val)
+    elif rem == 5:
+        sys_times.append(val)
+
+print("Real Time: %2.3f±%0.3f" % (mean(real_times), std_dev(real_times)))
+print("User Time: %2.3f±%0.3f" % (mean(user_times), std_dev(user_times)))
+print("Sys  Time: %2.3f±%0.3f" % (mean(sys_times), std_dev(sys_times)))

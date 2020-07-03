@@ -452,4 +452,5 @@ int rewrite_parents(struct rev_info *revs,
  */
 struct commit_list *get_saved_parents(struct rev_info *revs, const struct commit *commit);
 
+void log_topo_stats(struct rev_info *revs);
 #endif
