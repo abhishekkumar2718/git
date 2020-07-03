@@ -62,10 +62,10 @@ void git_test_write_commit_graph_or_die(void)
 
 #define GRAPH_METADATA_CHUNK_ENABLED 0
 
-#define GRAPH_GENERATION_DATA_CHUNK_ENABLED 1
-#define GENERATION_NUMBER_V3 1
+#define GRAPH_GENERATION_DATA_CHUNK_ENABLED 0
+#define GENERATION_NUMBER_V3 0
 #define GENERATION_NUMBER_V5 0
-#define GENERATION_COMPUTE_TOPOLOGICAL_LEVEL 1
+#define GENERATION_COMPUTE_TOPOLOGICAL_LEVEL 0
 
 #define GRAPH_DATA_WIDTH (the_hash_algo->rawsz + 16)
 
@@ -1429,7 +1429,10 @@ static void close_reachable(struct write_commit_graph_context *ctx)
 }
 
 /*
- * Store the corrected commit date in commit_graph_data->generation.
+ * CCD_3(C) = Date(C) + Offset(C) such that CCD_3(C) > CCD_3(P) for
+ * all parents P of C.
+ *
+ * Store the Offset(C) in commit_graph_data->generation.
  *
  * If GENERATION_COMPUTE_TOPOLOGICAL_LEVEL is set, calculate and store
  * topological levels in commit_graph_data->graph_pos
@@ -1438,6 +1441,9 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 {
 	int i;
 	struct commit_list *list = NULL;
+	uint32_t max_odate = 0;
+
+	trace2_region_enter("commit-graph", "compute_corrected_commit_dates", ctx->r);
 
 	if (ctx->report_progress)
 		ctx->progress = start_delayed_progress(
@@ -1445,19 +1451,17 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 					ctx->commits.nr);
 
 	for (i = 0; i < ctx->commits.nr; i++) {
-		struct commit_graph_data *data;
-		uint32_t offset, level, max_level = 0;
-
-		data = commit_graph_data_at(ctx->commits.list[i]);
-		offset = data->generation;
+		uint32_t level, max_level = 0;
+		struct commit_graph_data *data = commit_graph_data_at(ctx->commits.list[i]);
 
 		display_progress(ctx->progress, i + 1);
 
-		if (offset == GENERATION_NUMBER_INFINITY ||
-		    offset == GENERATION_NUMBER_ZERO)
+		if (data->generation != GENERATION_NUMBER_INFINITY &&
+		    data->generation != GENERATION_NUMBER_ZERO)
 			continue;
 
 		commit_list_insert(ctx->commits.list[i], &list);
+
 		while (list) {
 			struct commit *current = list->item;
 			struct commit_list *parent;
@@ -1467,25 +1471,24 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 			for (parent = current->parents; parent; parent = parent->next) {
 				timestamp_t parent_timestamp;
 				data = commit_graph_data_at(parent->item);
-				offset = data->generation;
 
-				if (offset != GENERATION_NUMBER_INFINITY &&
-				    offset != GENERATION_NUMBER_ZERO) {
+				if (data->generation == GENERATION_NUMBER_INFINITY ||
+				    data->generation == GENERATION_NUMBER_ZERO) {
 					all_parents_computed = 0;
 					commit_list_insert(parent->item, &list);
 					break;
-				}
+				} else {
+					parent_timestamp = parent->item->date + data->generation;
 
-				parent_timestamp = parent->item->date + offset;
+					if (parent_timestamp > max_timestamp)
+						max_timestamp = parent_timestamp + 1;
 
-				if (max_timestamp < parent_timestamp)
-					max_timestamp = parent_timestamp + 1;
+					if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
+						level = data->graph_pos;
 
-				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
-					level = data->graph_pos;
-
-					if (max_level < level) {
-						max_level = level;
+						if (max_level < level) {
+							max_level = level;
+						}
 					}
 				}
 			}
@@ -1493,7 +1496,7 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 			if (all_parents_computed) {
 				data = commit_graph_data_at(current);
 
-				data->generation = (max_timestamp - current->date) + 1;
+				data->generation = (uint32_t) (max_timestamp - current->date) + 1;
 
 				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
 					data->graph_pos = max_level + 1;
@@ -1504,6 +1507,9 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 				if (data->generation > GENERATION_NUMBER_MAX)
 					data->generation = GENERATION_NUMBER_MAX;
 
+				if (data->generation > max_odate)
+					max_odate = data->generation;
+
 				if (GENERATION_COMPUTE_TOPOLOGICAL_LEVEL) {
 					if (data->graph_pos > GENERATION_NUMBER_MAX)
 						data->graph_pos = GENERATION_NUMBER_MAX;
@@ -1512,11 +1518,17 @@ static void compute_corrected_commit_dates(struct write_commit_graph_context *ct
 		}
 	}
 
+	trace2_data_intmax("commit-graph", ctx->r, "max_odate3", max_odate);
+	trace2_region_leave("commit-graph", "compute_corrected_commit_dates", ctx->r);
+
 	stop_progress(&ctx->progress);
 }
 
 /*
- * Store the corrected date offset in commit_graph_data->generation.
+ * CCD_5(C) = Date(C) + Offset(C) such that for all parents P of C,
+ * CCD_5(C) > CCD_5(P) and Offset(C) > Offset(P)
+ *
+ * Store Offset(C) in commit_graph_data->generation.
  *
  * For both metadata and generation data chunk approaches, write the
  * corrected date offset into CDAT.
