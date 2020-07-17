@@ -349,6 +349,7 @@ int compare_commits_by_author_date(const void *a_, const void *b_, void *unused)
 void verify_merge_signature(struct commit *commit, int verbose,
 			    int check_trust);
 
+/* Newer commits first */
 int compare_commits_by_commit_date(const void *a_, const void *b_, void *unused);
 int compare_commits_by_gen_then_commit_date(const void *a_, const void *b_, void *unused);
 

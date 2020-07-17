@@ -146,4 +146,7 @@ struct commit_graph_data {
  */
 uint32_t commit_graph_generation(const struct commit *);
 uint32_t commit_graph_position(const struct commit *);
+
+/* Older commits first */
+int compare_commits_by_gen(const void *_a, const void *_b);
 #endif
